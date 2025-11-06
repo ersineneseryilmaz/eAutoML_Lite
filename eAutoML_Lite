@@ -1,0 +1,495 @@
+# -*- coding: utf-8 -*-
+"""eAutoML-lite2.ipynb
+
+Coded by Ersin Enes ERYILMAZ.
+
+Original file is located at
+    https://colab.research.google.com/drive/1ukxxArNzPRptS6KrlKWhsWbnwPuVJzkJ
+"""
+
+# AutoML-Lite v4.1 — Tam, sağlam ve iki sekmeli Gradio arayüzü
+import os, time, joblib, tracemalloc, gc
+import pandas as pd, numpy as np
+import matplotlib.pyplot as plt, seaborn as sns
+import psutil
+from io import BytesIO
+
+# ML
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, log_loss,
+    confusion_matrix, classification_report, roc_curve, auc
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
+
+# UI
+import gradio as gr
+
+# Optional (SHAP)
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
+
+# Create dirs
+os.makedirs("models", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+os.makedirs("preproc", exist_ok=True)
+os.makedirs("datasets", exist_ok=True)
+
+# ---------- Auto dataset URLs (indiriliyor eğer yoksa) ----------
+DATASET_URLS = {
+    "heart": "https://raw.githubusercontent.com/ersineneseryilmaz/eAutoML_Lite/main/heart.csv",
+    "breast": "https://raw.githubusercontent.com/ersineneseryilmaz/eAutoML_Lite/main/breast.csv",
+    "diabetes": "https://raw.githubusercontent.com/ersineneseryilmaz/eAutoML_Lite/main/diabetes.csv",
+    "kidney": "https://raw.githubusercontent.com/ersineneseryilmaz/eAutoML_Lite/main/kidney.csv",
+}
+
+def ensure_dataset(name):
+    """Veri kümesini datasets/{name}.csv olarak indir ve yolunu döndür."""
+    fname = f"datasets/{name}.csv"
+    if not os.path.exists(fname):
+        if name not in DATASET_URLS:
+            raise ValueError(f"Bu isim için otomatik url yok: {name}")
+        print(f"İndiriliyor: {name} ...")
+        df = pd.read_csv(DATASET_URLS[name])
+        # küçük temizlemeler: bazı kaynaklarda boş başlık veya fazladan indeks olabilir
+        df.to_csv(fname, index=False)
+    return fname
+
+# ---------- Hedef sütunu bulucu ----------
+TARGET_CANDIDATES = [
+    "target", "diagnosis", "Outcome", "outcome", "class", "Class",
+    "classification", "label", "category", "result"
+]
+
+def detect_target_col(df):
+    # 1) doğrudan isim arama
+    for cand in TARGET_CANDIDATES:
+        if cand in df.columns:
+            return cand
+    # 2) bazı datasetlerde 'status' ya da 'status' like olabilir
+    for c in df.columns:
+        if c.lower().startswith("class") or c.lower().startswith("diagnos") or c.lower().startswith("out"):
+            return c
+    # 3) son çare: son sütun
+    return df.columns[-1]
+
+# ---------- Preprocessing helper ----------
+def fit_preprocessor(df, dataset_name):
+    """
+    Girdi: ham DataFrame
+    Çıktı: preproc dict kaydedilir, X_scaled, y
+    preproc: {feature_cols, target_col, encoders (LabelEncoder per col for object features),
+              imputers (SimpleImputer per col), scaler}
+    """
+    df = df.copy()
+    target_col = detect_target_col(df)
+    # normalize column names (trim)
+    df.columns = [c.strip() for c in df.columns]
+
+    # if target is object, encode
+    if df[target_col].dtype == "object" or df[target_col].dtype == "bool":
+        df[target_col] = LabelEncoder().fit_transform(df[target_col].astype(str))
+    else:
+        # if numeric continuous (many unique), binarize by median
+        unique_vals = df[target_col].nunique()
+        if unique_vals > 10:
+            df[target_col] = (df[target_col] > df[target_col].median()).astype(int)
+
+    # handle feature columns: encode objects, impute
+    feature_cols = [c for c in df.columns if c != target_col]
+    encoders = {}
+    imputers = {}
+    df_feat = pd.DataFrame(index=df.index)
+    for col in feature_cols:
+        col_data = df[col]
+        if col_data.dtype == "object" or col_data.dtype == "bool":
+            le = LabelEncoder()
+            # convert to str to avoid unseen types
+            df_feat[col] = le.fit_transform(col_data.astype(str).fillna("nan"))
+            encoders[col] = le
+            imputers[col] = SimpleImputer(strategy="most_frequent")  # although labelencoded, still impute
+            df_feat[col] = imputers[col].fit_transform(df_feat[[col]])
+        else:
+            # numeric
+            imputers[col] = SimpleImputer(strategy="median")
+            df_feat[col] = imputers[col].fit_transform(df[[col]])
+    # scaler
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df_feat)
+    y = df[target_col].values
+
+    preproc = {
+        "target_col": target_col,
+        "feature_cols": feature_cols,
+        "encoders": encoders,      # dict of LabelEncoder objects for categorical features
+        "imputers": imputers,      # dict of SimpleImputer objects
+        "scaler": scaler
+    }
+    # save preproc
+    joblib.dump(preproc, f"preproc/{dataset_name}_preproc.pkl")
+    return X_scaled, y, preproc
+
+def transform_with_preproc(df_input, preproc):
+    """
+    df_input: DataFrame with arbitrary columns (user input or single-row)
+    preproc: loaded preproc dict
+    returns: X_scaled (2D numpy) and y_placeholder (zeros)
+    """
+    df = df_input.copy()
+    feature_cols = preproc["feature_cols"]
+    encoders = preproc["encoders"]
+    imputers = preproc["imputers"]
+    scaler = preproc["scaler"]
+
+    # ensure all feature_cols exist
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # drop extras and keep order
+    df = df[feature_cols]
+
+    # apply encoders & imputers
+    for col in feature_cols:
+        if col in encoders:
+            # unseen labels -> LabelEncoder will throw; convert unknowns to string and try transform, if fails map to -1
+            try:
+                df[col] = df[col].astype(str)
+                df[col] = encoders[col].transform(df[col].fillna("nan"))
+            except Exception:
+                # fallback: map unseen to most frequent class (or 0)
+                df[col] = df[col].astype(str).fillna("nan")
+                known_classes = list(encoders[col].classes_)
+                df[col] = df[col].apply(lambda v: encoders[col].transform([v])[0] if v in known_classes else 0)
+        # impute (works for both numeric and encoded)
+        try:
+            df[col] = imputers[col].transform(df[[col]])
+        except Exception:
+            # fallback: fillna with 0
+            df[col] = df[col].fillna(0)
+
+    # scale
+    X_scaled = scaler.transform(df)
+    # dummy y
+    y_dummy = np.zeros(X_scaled.shape[0], dtype=int)
+    return X_scaled, y_dummy
+
+# ---------- Main AutoML class ----------
+class AutoMLLite:
+    def __init__(self):
+        self.models = {
+            "LogisticRegression": LogisticRegression(max_iter=500),
+            "RandomForest": RandomForestClassifier(n_estimators=100),
+            "GradientBoosting": GradientBoostingClassifier(),
+            "MLP": MLPClassifier(max_iter=300)
+        }
+
+    def train(self, dataset_name, upload_file_path=None):
+        """
+        dataset_name: one of 'heart','breast','diabetes','kidney' or 'user'
+        upload_file_path: if user uploaded csv, path to it
+        """
+        # load df
+        if dataset_name == "user":
+            if not upload_file_path:
+                return "❌ Kullanıcı dosyası belirtilmedi.", None, None, None, None
+            df = pd.read_csv(upload_file_path)
+            ds_label = os.path.splitext(os.path.basename(upload_file_path))[0]
+        else:
+            csv_path = ensure_dataset(dataset_name)
+            df = pd.read_csv(csv_path)
+            ds_label = dataset_name
+
+        # fit preprocessor
+        try:
+            X_scaled, y, preproc = fit_preprocessor(df, ds_label)
+        except Exception as e:
+            return f"❌ Ön işlem hatası: {e}", None, None, None, None
+
+        # split
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+        # train each model and record metrics
+        results = []
+        process = psutil.Process()
+        tracemalloc.start()
+        t_start = time.time()
+        for name, model in self.models.items():
+            t0 = time.time()
+            try:
+                model.fit(X_train, y_train)
+                preds = model.predict(X_test)
+            except Exception as e:
+                # model failed
+                results.append({
+                    "Model": name,
+                    "Accuracy": np.nan, "Precision": np.nan, "Recall": np.nan,
+                    "F1": np.nan, "LogLoss": np.nan, "TrainTime": time.time()-t0, "MemoryMB": np.nan
+                })
+                continue
+
+            probs = model.predict_proba(X_test) if hasattr(model, "predict_proba") else None
+            acc = accuracy_score(y_test, preds)
+            prec = precision_score(y_test, preds, average="weighted", zero_division=0)
+            rec = recall_score(y_test, preds, average="weighted", zero_division=0)
+            f1 = f1_score(y_test, preds, average="weighted", zero_division=0)
+            ll = log_loss(y_test, probs) if probs is not None else np.nan
+            mem_mb = process.memory_info().rss / 1024**2
+            results.append({
+                "Model": name,
+                "Accuracy": acc, "Precision": prec, "Recall": rec,
+                "F1": f1, "LogLoss": ll, "TrainTime": time.time()-t0, "MemoryMB": mem_mb
+            })
+        t_total = time.time() - t_start
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        peak_mb = peak / 1024**2
+
+        # decide best model by F1 (higher better)
+        res_df = pd.DataFrame(results)
+        # If all NaN (all models failed)
+        if res_df["F1"].dropna().empty:
+            return "❌ Tüm modeller başarısız oldu.", None, None, None, None
+
+        best_idx = res_df["F1"].idxmax()
+        best_row = res_df.loc[best_idx]
+        best_model_name = best_row["Model"]
+        best_model = self.models[best_model_name]
+        # fit best model on full data (X_scaled, y)
+        best_model.fit(X_scaled, y)
+
+        # save model + preproc info
+        # Save model package: (model, preproc)
+        model_pkg = {
+            "model": best_model,
+            "preproc": preproc
+        }
+        joblib.dump(model_pkg, f"models/{ds_label}_best.pkl")
+
+        # --- Confusion matrix & classification report ---
+        preds_full = best_model.predict(X_test)
+        cm = confusion_matrix(y_test, preds_full)
+        class_report = classification_report(y_test, preds_full, zero_division=0, output_dict=True)
+
+        # --- ROC (multi or binary) plot ---
+        roc_path = None
+        try:
+            plt.figure(figsize=(6,5))
+            y_unique = np.unique(y_test)
+            if len(y_unique) == 2:
+                # binary: plot best model if has predict_proba
+                if hasattr(best_model, "predict_proba"):
+                    y_score = best_model.predict_proba(X_test)[:,1]
+                    fpr, tpr, _ = roc_curve(y_test, y_score)
+                    roc_auc = auc(fpr, tpr)
+                    plt.plot(fpr, tpr, label=f"{best_model_name} (AUC={roc_auc:.3f})")
+                    plt.plot([0,1],[0,1],'k--')
+                    plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC Curve")
+                    plt.legend()
+                    roc_path = f"results/{ds_label}_roc.png"
+                    plt.savefig(roc_path); plt.close()
+            else:
+                # multiclass: one-vs-rest
+                if hasattr(best_model, "predict_proba"):
+                    from sklearn.preprocessing import label_binarize
+                    y_bin = label_binarize(y_test, classes=y_unique)
+                    y_score = best_model.predict_proba(X_test)
+                    plt.figure(figsize=(6,5))
+                    for i, cls in enumerate(y_unique):
+                        fpr, tpr, _ = roc_curve(y_bin[:,i], y_score[:,i])
+                        plt.plot(fpr, tpr, label=f"Class {cls}")
+                    plt.plot([0,1],[0,1],'k--'); plt.xlabel("FPR"); plt.ylabel("TPR")
+                    plt.title("Multi-class ROC"); plt.legend()
+                    roc_path = f"results/{ds_label}_roc.png"
+                    plt.savefig(roc_path); plt.close()
+        except Exception as e:
+            roc_path = None
+
+        # --- Barplot of F1 scores ---
+        try:
+            plt.figure(figsize=(7,4))
+            sns.barplot(data=res_df.sort_values("F1", ascending=False), x="Model", y="F1")
+            plt.title(f"{ds_label} - Model F1 karşılaştırması")
+            bar_path = f"results/{ds_label}_barplot.png"
+            plt.tight_layout(); plt.savefig(bar_path); plt.close()
+        except Exception:
+            bar_path = None
+
+        # --- SHAP summary for best model ---
+        shap_path = None
+        if SHAP_AVAILABLE:
+            try:
+                # To run shap for tree models or linear etc, shap.Explainer tries to pick appropriate explainer
+                explainer = shap.Explainer(best_model, X_train if 'X_train' in locals() else X_scaled)
+                shap_vals = explainer(X_test)
+                shap.summary_plot(shap_vals, feature_names=preproc["feature_cols"], show=False)
+                shap_path = f"results/{ds_label}_shap.png"
+                plt.tight_layout(); plt.savefig(shap_path); plt.close()
+            except Exception as e:
+                shap_path = None
+
+        # save results CSV
+        res_df.to_csv(f"results/{ds_label}_results.csv", index=False)
+
+        summary_text = (
+            f"✅ {ds_label} eğitimi tamamlandı!\n"
+            f"🏆 En iyi model: {best_model_name}\n"
+            f"📊 En yüksek F1: {best_row['F1']:.4f}\n"
+            f"🕒 Toplam süre: {t_total:.2f} s\n"
+            f"💾 Peak memory: {peak_mb:.2f} MB\n"
+            f"📁 Sonuçlar: results/{ds_label}_results.csv"
+        )
+
+        return summary_text, res_df, pd.DataFrame(class_report).transpose(), cm, roc_path, bar_path, shap_path
+
+    def predict(self, dataset_name, input_values):
+        """
+        input_values: dict (column->value) OR list/tuple of values in feature order
+        """
+        model_file = f"models/{dataset_name}_best.pkl"
+        if not os.path.exists(model_file):
+            return {"error": "Model yok. Önce eğitin."}
+        pkg = joblib.load(model_file)
+        model = pkg["model"]
+        preproc = pkg["preproc"]
+
+        # Accept dict or list/string
+        if isinstance(input_values, dict):
+            df_in = pd.DataFrame([input_values])
+        elif isinstance(input_values, (list, tuple)):
+            # map list to feature_cols order
+            cols = preproc["feature_cols"]
+            if len(input_values) != len(cols):
+                return {"error": f"Uzunluk uyuşmuyor: beklenen {len(cols)} feature, verilen {len(input_values)}"}
+            df_in = pd.DataFrame([input_values], columns=cols)
+        elif isinstance(input_values, str):
+            # expect comma-separated
+            parts = [p.strip() for p in input_values.split(",")]
+            cols = preproc["feature_cols"]
+            if len(parts) != len(cols):
+                return {"error": f"Uzunluk uyuşmuyor: beklenen {len(cols)} feature, verilen {len(parts)}"}
+            df_in = pd.DataFrame([parts], columns=cols)
+        else:
+            return {"error": "Girdi formatı tanınmadı (dict/list/str)"}
+
+        # transform with preproc
+        try:
+            X_scaled, _ = transform_with_preproc(df_in, preproc)
+        except Exception as e:
+            return {"error": f"Ön işlem (transform) hatası: {e}"}
+
+        try:
+            pred = model.predict(X_scaled)[0]
+            proba = model.predict_proba(X_scaled)[0].tolist() if hasattr(model, "predict_proba") else None
+            return {"prediction": int(pred), "probabilities": proba}
+        except Exception as e:
+            return {"error": f"Model tahmin hatası: {e}"}
+
+# ---------- Gradio UI ----------
+automl = AutoMLLite()
+
+def ui_train(dataset_choice, upload_file):
+    # dataset_choice: one of dataset keys or "user"
+    if dataset_choice == "user":
+        if upload_file is None:
+            return "❌ Lütfen CSV dosyası yükleyin.", None, None, None, None, None, None
+        path = upload_file.name
+        # Ensure file is saved locally (gradio provides a temp path)
+        # read and re-save to datasets folder to keep consistency
+        try:
+            df = pd.read_csv(path)
+            local = f"datasets/{os.path.splitext(os.path.basename(path))[0]}_user.csv"
+            df.to_csv(local, index=False)
+            dataset_label = "user"
+            summary = automl.train("user", upload_file.name)
+            # train returns tuple or error; handle inside
+        except Exception as e:
+            return f"❌ Yükleme hatası: {e}", None, None, None, None, None, None
+    else:
+        dataset_label = dataset_choice
+    out = automl.train(dataset_label, None if dataset_label != "user" else local)
+    # out: summary_text, res_df, class_report_df, cm, roc_path, bar_path, shap_path
+    if not isinstance(out, tuple):
+        return out, None, None, None, None, None, None
+    summary_text, res_df, class_report_df, cm, roc_path, bar_path, shap_path = out
+    # prepare images to show in gradio: paths or None
+    images = []
+    for p in [roc_path, bar_path, shap_path]:
+        images.append(p if (p and os.path.exists(p)) else None)
+    # confusion matrix dataframe
+    cm_df = pd.DataFrame(cm) if cm is not None else None
+    return summary_text, res_df, class_report_df, cm_df, images[0], images[1], images[2]
+
+def ui_predict(dataset_choice, user_input_text):
+    # accept json-like, dict-like string, or comma-separated
+    # try to parse to dict first
+    try:
+        import json
+        parsed = None
+        s = user_input_text.strip()
+        if s.startswith("{"):
+            parsed = json.loads(s)
+        elif ":" in s and "," in s and "{" not in s:
+            # maybe key:value pairs separated by commas -> try parse
+            items = [p.strip() for p in s.split(",")]
+            dd = {}
+            for it in items:
+                if ":" in it:
+                    k,v = it.split(":",1)
+                    dd[k.strip()] = float(v.strip())
+                else:
+                    raise ValueError("Beklenen format key:val,key2:val2 veya virgülle ayrılmış değerler.")
+            parsed = dd
+        else:
+            # treat as comma-separated values
+            parsed = s
+    except Exception as e:
+        return f"❌ Girdi parse hatası: {e}"
+
+    res = automl.predict(dataset_choice if dataset_choice != "user" else "user", parsed)
+    if isinstance(res, dict) and "error" in res:
+        return f"❌ {res['error']}"
+    else:
+        return f"🔮 Tahmin: {res['prediction']}\nOlasılıklar: {res['probabilities']}"
+
+# Gradio layout
+with gr.Blocks() as demo:
+    gr.Markdown("# 🧠 AutoML-Lite v4.1")
+    gr.Markdown("Açıklama: sol sekmeden hazır veri kümesi seçin veya kendi CSV'nizi yükleyin. Eğitilen model sonuçları, grafikler ve SHAP (mevcutsa) gösterilecektir. Sağ sekmede tahmin yapabilirsiniz.")
+
+    with gr.Tabs():
+        with gr.TabItem("📘 Eğitim"):
+            with gr.Row():
+                ds_dropdown = gr.Dropdown(choices=["heart","breast","diabetes","kidney","user"], value="heart", label="Veri kümesi seç")
+                upload_file = gr.File(label="Veya kendi CSV yükle (opsiyonel)")
+            train_btn = gr.Button("🚀 Eğit")
+            summary_box = gr.TextArea(label="Eğitim Özeti", interactive=False)
+            results_table = gr.Dataframe(label="Model sonuçları (CSV)")
+            class_report_table = gr.Dataframe(label="Sınıf raporu")
+            cm_table = gr.Dataframe(label="Karışıklık matrisi")
+            roc_img = gr.Image(label="ROC Eğrisi")
+            bar_img = gr.Image(label="Model F1 Barplot")
+            shap_img = gr.Image(label="SHAP Özet (varsa)")
+
+            train_btn.click(fn=ui_train, inputs=[ds_dropdown, upload_file],
+                            outputs=[summary_box, results_table, class_report_table, cm_table, roc_img, bar_img, shap_img])
+
+        with gr.TabItem("🔮 Tahmin"):
+            gr.Markdown("Tahmin için: 1) JSON formatında {'col1':val1,...} veya 2) virgülle ayrılmış değerler veya 3) key:value, key2:value2 şeklinde giriş yapabilirsiniz. " )
+            pred_ds = gr.Dropdown(choices=["heart","breast","diabetes","kidney","user"], value="heart", label="Tahmin için model")
+            pred_input = gr.TextArea(label="Tahmin girişi (JSON veya virgül ile)", placeholder='{"age":55,"sex":1,...} veya "55,1,..." veya "age:55,sex:1,..."')
+            pred_btn = gr.Button("Tahmin Et")
+            pred_out = gr.TextArea(label="Tahmin Sonucu")
+
+            pred_btn.click(fn=ui_predict, inputs=[pred_ds, pred_input], outputs=[pred_out])
+
+    gr.Markdown("Not: SHAP çalışması için `shap` paketinin yüklü olması gerekir. SHAP yüklü değilse özet gösterilmeyecektir.")
+
+demo.launch()
